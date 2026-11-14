@@ -8,6 +8,15 @@
 按该周期折叠的相位散点图;固定时刻随机重排光通量 200 次,每次重算
 全频段最大功率,给出置换尾概率 (不低于原峰的次数+1)/201。
 
+跨夜通量校正
+------------
+上传参照星测量(night_id、star_id、flux)与目标星测量
+(night_id、time_day、flux),给出锚星星号、固有通量与最大相对偏差;
+按「观测通量 = 固有通量 × 当夜透过率」联合估计从锚星可达的各夜
+透过率(见 app/calibration.py)。参照测量无法同时满足偏差限时,列出
+冲突的夜晚和星号;与锚星不连通的夜晚列为未校准,其目标观测不进入
+结果;校正后仍需满足原周期入口的行数与时刻规则。结果只存内存。
+
 并发与生命周期
 --------------
 * 每批任务使用两个计算子进程,最多两批并行,超额拒绝(HTTP 429);
@@ -40,10 +49,15 @@ import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
+from app import calibration
+
 APP_DIR = Path(__file__).resolve().parent
 WORKER_PY = APP_DIR / "worker.py"
 INDEX_HTML = APP_DIR / "static" / "index.html"
 SAMPLE_CSV = APP_DIR.parent / "sample" / "sample_star.csv"
+SAMPLE_REF_CSV = APP_DIR.parent / "sample" / "reference_bridge.csv"
+SAMPLE_CONFLICT_CSV = APP_DIR.parent / "sample" / "reference_conflict.csv"
+SAMPLE_TARGET_CSV = APP_DIR.parent / "sample" / "target_star.csv"
 
 N_FREQ = 10_000          # 频率网格点数
 N_PERM = 200             # 置换检验次数
@@ -57,6 +71,9 @@ TERMINAL_STATES = ("done", "failed", "cancelled")
 
 # 全部任务状态只存内存
 JOBS: dict[str, "Job"] = {}
+
+# 最近一次成功校正结果(只存内存,重启即清空)
+CALIBRATION: dict | None = None
 
 
 class Job:
@@ -371,6 +388,96 @@ async def sample_csv() -> FileResponse:
         raise HTTPException(404, "样例文件不存在")
     return FileResponse(SAMPLE_CSV, media_type="text/csv",
                         filename="sample_star.csv")
+
+
+@app.get("/api/samples/reference.csv")
+async def sample_reference_csv() -> FileResponse:
+    if not SAMPLE_REF_CSV.exists():
+        raise HTTPException(404, "参照测量样例文件不存在")
+    return FileResponse(SAMPLE_REF_CSV, media_type="text/csv",
+                        filename="reference_bridge.csv")
+
+
+@app.get("/api/samples/reference_conflict.csv")
+async def sample_reference_conflict_csv() -> FileResponse:
+    if not SAMPLE_CONFLICT_CSV.exists():
+        raise HTTPException(404, "矛盾参照测量样例文件不存在")
+    return FileResponse(SAMPLE_CONFLICT_CSV, media_type="text/csv",
+                        filename="reference_conflict.csv")
+
+
+@app.get("/api/samples/target.csv")
+async def sample_target_csv() -> FileResponse:
+    if not SAMPLE_TARGET_CSV.exists():
+        raise HTTPException(404, "目标测量样例文件不存在")
+    return FileResponse(SAMPLE_TARGET_CSV, media_type="text/csv",
+                        filename="target_star.csv")
+
+
+async def _read_upload(file: UploadFile | None, label: str) -> bytes:
+    if file is None:
+        raise HTTPException(400, f"缺少{label}文件")
+    raw = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(400, f"{label}文件过大")
+    return raw
+
+
+@app.post("/api/calibrations", status_code=201)
+async def create_calibration(
+        reference: UploadFile = File(...),
+        target: UploadFile = File(...),
+        anchor_star_id: str = Form(...),
+        anchor_flux: str = Form(...),
+        max_rel_dev: str = Form(...)) -> dict:
+    """跨夜通量校正:成功时返回透过率报告与按时刻排序的校正 CSV。"""
+    global CALIBRATION
+
+    # 本次尝试一开始就作废上一次的结果:失败时不得留下可下载的旧文件
+    CALIBRATION = None
+    try:
+        anchor_flux_value = float(anchor_flux)
+        max_rel_dev_value = float(max_rel_dev)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "锚星固有通量与最大相对偏差必须为数值")
+
+    reference_raw = await _read_upload(reference, "参照星测量")
+    target_raw = await _read_upload(target, "目标星测量")
+    try:
+        # 联合估计是 CPU 密集的同步计算,放到线程里避免阻塞其它请求
+        report = await asyncio.to_thread(
+            calibration.run_calibration,
+            reference_raw, target_raw, anchor_star_id,
+            anchor_flux_value, max_rel_dev_value)
+    except calibration.CalibrationError as exc:
+        raise HTTPException(exc.status_code, exc.detail)
+
+    CALIBRATION = report
+    return {k: v for k, v in report.items() if k != "csv"}
+
+
+@app.get("/api/calibrations/latest")
+async def latest_calibration() -> dict:
+    if CALIBRATION is None:
+        raise HTTPException(404, "暂无校正结果")
+    return {k: v for k, v in CALIBRATION.items() if k != "csv"}
+
+
+@app.get("/api/calibrations/latest.csv")
+async def latest_calibration_csv() -> Response:
+    if CALIBRATION is None:
+        raise HTTPException(404, "暂无校正结果")
+    return Response(content=CALIBRATION["csv"], media_type="text/csv",
+                    headers={"Content-Disposition":
+                             'attachment; filename="calibrated_target.csv"'})
+
+
+@app.get("/api/calibrations")
+async def calibration_summary() -> dict:
+    """最近一次成功校正的摘要(供页面轮询/复核)。"""
+    if CALIBRATION is None:
+        return {"has_result": False, "nights": [], "uncalibrated_nights": []}
+    return {k: v for k, v in CALIBRATION.items() if k != "csv"}
 
 
 @app.post("/api/jobs", status_code=201)

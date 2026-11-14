@@ -29,7 +29,9 @@
   button:disabled { background:#aab4c0; cursor:not-allowed; }
   .hint { font-size:12px; color:var(--gray); margin:10px 0 0; line-height:1.7; }
   #msg { margin-top:10px; font-size:13px; min-height:18px; }
-  #msg.err { color:var(--red); } #msg.ok { color:var(--green); }
+  #msg.err, #calMsg.err { color:var(--red); }
+  #msg.ok, #calMsg.ok { color:var(--green); }
+  #calMsg { margin-top:10px; font-size:13px; min-height:18px; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #edf0f5; }
   th { color:#556; font-weight:600; background:#f8fafc; }
@@ -55,20 +57,72 @@
             border-radius:8px; padding:10px 14px; font-size:13px;
             white-space:pre-wrap; }
   .row-actions button { margin-right:6px; padding:5px 10px; font-size:12px; }
+  .okbox { background:#eef8f1; border:1px solid #bfe3c9; color:#1e6b37;
+           border-radius:8px; padding:10px 14px; font-size:13px; line-height:1.7; }
+  .warnbox { background:#fff8e6; border:1px solid #f0dca4; color:#7a5b10;
+             border-radius:8px; padding:10px 14px; font-size:13px; line-height:1.7; }
+  .cal-form { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; }
+  .cal-form input[type=text], .cal-form input[type=number] {
+    padding:7px 9px; border:1px solid #c9d2de; border-radius:6px;
+    font-size:13px; background:#fbfcfe; width:150px; }
+  .throughput { font-size:18px; font-weight:600; color:#163a5f;
+                font-variant-numeric:tabular-nums; }
+  td.num { font-variant-numeric:tabular-nums; }
+  a.download { display:inline-block; padding:8px 16px; border-radius:6px;
+    background:var(--green); color:#fff; font-size:13px; text-decoration:none; }
+  a.download:hover { background:#196c3b; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:10px;
+         font-size:12px; background:#eef2f7; color:#445; margin-left:6px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>周期变星候选筛选</h1>
-  <p>上传单颗星的测光序列(CSV,含 time_day、flux 两列),系统以带浮动均值的
-     Lomb–Scargle 周期图在指定周期范围内搜索信号,展示最高峰周期、功率谱与
-     相位折叠散点,并通过 200 次通量置换估计尾概率,供人工复核。</p>
+  <h1>巡测周期筛查:跨夜通量校正 + 候选筛选</h1>
+  <p>先把不同夜晚的目标星通量校正到同一尺度,再交给原有周期筛查。
+     参照星测量按「观测通量 = 固有通量 × 当夜透过率」联合估计从锚星可达
+     的各夜透过率;校正后的序列可直接下载,也可用于下方的 Lomb–Scargle
+     候选筛选。</p>
 </header>
 <main>
   <section class="card">
-    <h2>提交新批</h2>
+    <h2>① 跨夜通量校正</h2>
+    <form id="calForm" class="cal-form">
+      <label>参照星测量 CSV(night_id、star_id、flux)
+        <input type="file" name="reference" accept=".csv,text/csv" required>
+      </label>
+      <label>目标星测量 CSV(night_id、time_day、flux)
+        <input type="file" name="target" accept=".csv,text/csv" required>
+      </label>
+      <label>锚星星号
+        <input type="text" name="anchor_star_id" value="S_ANCHOR" required>
+      </label>
+      <label>锚星固有通量
+        <input type="number" name="anchor_flux" step="any" min="0" value="100" required>
+      </label>
+      <label>最大相对偏差
+        <input type="number" name="max_rel_dev" step="any" min="0" value="0.05" required>
+      </label>
+      <button type="submit">校正并检查参照测量</button>
+      <button type="button" class="secondary" id="calSampleBtn">载入虚构样例并校正</button>
+      <button type="button" class="secondary" id="calConflictBtn">载入相互矛盾的样例</button>
+    </form>
+    <div id="calMsg"></div>
+    <p class="hint">通量必须为正;参照星可跨夜重复,只要「星—夜」图把各夜
+       串到锚星上即可联合定标。若有参与校正的参照测量无法同时满足偏差限,
+       页面会列出冲突的夜晚和星号且不生成文件;与锚星不连通的夜晚列为
+       未校准,其目标观测不进入结果;剩余观测仍须满足原周期入口规则
+       (至少 10 行、时刻互异),否则同样不生成文件。</p>
+  </section>
+
+  <section class="card" id="calResultCard" hidden>
+    <h2>校正结果</h2>
+    <div id="calResultBody"></div>
+  </section>
+
+  <section class="card">
+    <h2>② 周期候选筛选(原入口)</h2>
     <form id="submitForm">
-      <label>测光 CSV 文件
+      <label>测光 CSV 文件(校正后可直接使用下载文件)
         <input type="file" name="file" accept=".csv,text/csv" required>
       </label>
       <label>周期下限(天)
@@ -123,6 +177,157 @@ async function parseError(resp) {
     return j.detail || ("HTTP " + resp.status);
   } catch (e) { return "HTTP " + resp.status; }
 }
+
+// ---------------- 跨夜通量校正 ----------------
+
+function calMsg(text, ok) {
+  const m = $("calMsg");
+  m.textContent = text;
+  m.className = ok ? "ok" : "err";
+}
+
+function pct(v) {
+  return (v * 100).toFixed(2) + "%";
+}
+
+const CAL_REASON = { disconnected_from_anchor: "与锚星不连通",
+                     not_in_reference: "参照数据中没有该夜" };
+
+function calReason(reason) {
+  return CAL_REASON[reason] || String(reason);
+}
+
+function calDetailText(detail) {
+  if (!detail) return "提交失败";
+  if (typeof detail === "string") return detail;
+  return detail.message || JSON.stringify(detail);
+}
+
+function renderCalibrationError(detail) {
+  const card = $("calResultCard");
+  card.hidden = false;
+  let html = `<div class="errbox">${esc(calDetailText(detail))}</div>`;
+  if (detail && detail.conflicts) {
+    html += `<p class="hint">参与校正的以下参照测量与原假设
+      (观测通量 = 固有通量 × 当夜透过率)不相容,偏差超过
+      ${esc(String(detail.max_rel_dev))} 的限值:</p>` +
+      `<table><thead><tr><th>夜晚</th><th>星号</th><th>观测通量</th>
+       <th>预测通量</th><th>相对偏差</th></tr></thead><tbody>` +
+      detail.conflicts.map((c) =>
+        `<tr><td class="mono">${esc(c.night_id)}</td>` +
+        `<td class="mono">${esc(c.star_id)}</td>` +
+        `<td class="num">${c.observed_flux.toPrecision(7)}</td>` +
+        `<td class="num">${c.predicted_flux.toPrecision(7)}</td>` +
+        `<td class="num">${pct(c.rel_dev)}</td></tr>`).join("") +
+      `</tbody></table>`;
+  }
+  if (detail && detail.uncalibrated_nights && detail.uncalibrated_nights.length) {
+    html += `<p class="hint">与锚星不连通(或参照数据中没有)的夜晚,
+      其目标观测不进入结果:` +
+      detail.uncalibrated_nights.map((u) =>
+        `${esc(u.night_id)}(${esc(calReason(u.reason))}, ${u.n_target_rows} 行)`).join("、") +
+      `</p>`;
+  }
+  html += `<p class="hint">本次未生成校正文件;上一份校正结果已作废,
+    不可再下载。</p>`;
+  $("calResultBody").innerHTML = html;
+}
+
+function renderCalibration(report) {
+  const card = $("calResultCard");
+  card.hidden = false;
+  const rows = report.nights.map((n) =>
+    `<tr><td class="mono">${esc(n.night_id)}</td>` +
+    `<td><span class="throughput">${n.throughput.toPrecision(6)}</span></td>` +
+    `<td class="num">${n.n_reference_rows}</td>` +
+    `<td class="num">${n.n_target_rows}</td></tr>`).join("");
+  let html =
+    `<div class="okbox">参照测量全部满足最大相对偏差
+      ${esc(String(report.max_rel_dev))}(共 ${report.n_reference_used} 条参与、
+      ${report.n_reference_excluded} 条与锚星不连通被排除)。` +
+    `<br>锚星 <span class="mono">${esc(report.anchor_star_id)}</span>
+      固有通量取 ${esc(String(report.anchor_flux))};已把
+      ${report.n_target_calibrated} 条目标观测校正到同一尺度,
+      ${report.n_target_excluded} 条因夜晚未校准被舍弃。</div>`;
+  html += `<div class="metrics">` +
+    report.reference_star_fluxes.map((s) =>
+      `<div class="metric"><div class="k">${esc(s.star_id)} 固有通量</div>` +
+      `<div class="v">${s.intrinsic_flux.toPrecision(6)}</div></div>`).join("") +
+    `</div>`;
+  html += `<h3 style="font-size:14px;margin:14px 0 8px;color:#163a5f">各夜透过率</h3>` +
+    `<table><thead><tr><th>夜晚</th><th>透过率</th>
+      <th>参照测量行数</th><th>目标测量行数</th></tr></thead>` +
+    `<tbody>${rows}</tbody></table>`;
+  if (report.uncalibrated_nights.length) {
+    html += `<div class="warnbox" style="margin-top:12px">未校准夜晚:` +
+      report.uncalibrated_nights.map((u) =>
+        `<span class="mono">${esc(u.night_id)}</span>` +
+        `(${esc(calReason(u.reason))}` +
+        `,舍弃 ${u.n_target_rows} 行)`).join("、") +
+      `。这些目标观测不进入结果。</div>`;
+  }
+  html += `<p style="margin-top:14px">` +
+    `<a class="download" href="/api/calibrations/latest.csv" download="calibrated_target.csv">` +
+    `下载校正后 time_day、flux CSV(按时刻排序)</a></p>`;
+  $("calResultBody").innerHTML = html;
+}
+
+async function submitCalibration() {
+  const form = $("calForm");
+  const fd = new FormData(form);
+  for (const name of ["reference", "target"]) {
+    const f = form.querySelector(`input[name=${name}]`);
+    if (!f || !f.files.length) { calMsg("请先选择参照星与目标星测量 CSV", false); return; }
+  }
+  const resp = await fetch("/api/calibrations", { method: "POST", body: fd });
+  if (!resp.ok) {
+    let detail = null;
+    try { detail = (await resp.json()).detail; } catch (e) { /* 非 JSON */ }
+    calMsg("校正未通过,详见下方说明", false);
+    renderCalibrationError(detail);
+    return;
+  }
+  const report = await resp.json();
+  calMsg("校正完成,已生成校正文件", true);
+  renderCalibration(report);
+}
+
+$("calForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  await submitCalibration();
+});
+
+function setFileInput(selector, file) {
+  const input = document.querySelector(selector);
+  const dt = new DataTransfer();
+  dt.items.add(file);
+  input.files = dt.files;
+}
+
+async function loadCalibrationSample(conflict) {
+  calMsg("正在载入样例……", true);
+  try {
+    const [rRef, rTgt] = await Promise.all([
+      fetch(conflict ? "/api/samples/reference_conflict.csv" : "/api/samples/reference_bridge.csv"),
+      fetch("/api/samples/target.csv"),
+    ]);
+    if (!rRef.ok || !rTgt.ok) { calMsg("样例获取失败", false); return; }
+    const form = $("calForm");
+    setFileInput("input[name=reference]",
+      new File([await rRef.blob()],
+               conflict ? "reference_conflict.csv" : "reference_bridge.csv",
+               { type: "text/csv" }));
+    setFileInput("input[name=target]",
+      new File([await rTgt.blob()], "target_star.csv", { type: "text/csv" }));
+    form.querySelector("input[name=anchor_star_id]").value = "S_ANCHOR";
+    form.querySelector("input[name=anchor_flux]").value = "100";
+    form.querySelector("input[name=max_rel_dev]").value = "0.05";
+    await submitCalibration();
+  } catch (e) { calMsg("样例载入失败:" + e, false); }
+}
+
+$("calSampleBtn").addEventListener("click", () => loadCalibrationSample(false));
+$("calConflictBtn").addEventListener("click", () => loadCalibrationSample(true));
 
 async function submitFormData(fd) {
   const resp = await fetch("/api/jobs", { method: "POST", body: fd });
